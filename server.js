@@ -8,7 +8,14 @@ const { getStore } = require('@netlify/blobs');
 const app = express();
 const DB = path.join(__dirname, 'data.json');
 const SECRET = process.env.JWT_SECRET;
-const isNetlify = process.env.NETLIFY === 'true' || !!process.env.NETLIFY_DEV;
+// Netlify Functions run in a read-only /var/task filesystem. Detect the
+// serverless runtime explicitly so we never try to write data.json there.
+const isServerless = Boolean(
+  process.env.NETLIFY === 'true' ||
+  process.env.NETLIFY_DEV ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT
+);
 
 const seed = {
   settings: {
@@ -33,14 +40,17 @@ function localRead() {
   if (!fs.existsSync(DB)) fs.writeFileSync(DB, JSON.stringify(seed, null, 2));
   return JSON.parse(fs.readFileSync(DB, 'utf8'));
 }
+
 function localWrite(data) {
   fs.writeFileSync(DB, JSON.stringify(data, null, 2));
 }
+
 function store() {
   return getStore('nepkits-hub-data');
 }
+
 async function readData() {
-  if (!isNetlify) return localRead();
+  if (!isServerless) return localRead();
   let data = await store().get('data', { type: 'json' });
   if (!data) {
     data = JSON.parse(JSON.stringify(seed));
@@ -48,10 +58,12 @@ async function readData() {
   }
   return data;
 }
+
 async function writeData(data) {
-  if (!isNetlify) return localWrite(data);
+  if (!isServerless) return localWrite(data);
   await store().setJSON('data', data);
 }
+
 async function ensureAdmin() {
   if (!SECRET) throw new Error('JWT_SECRET is not configured');
   const data = await readData();
@@ -75,11 +87,7 @@ app.use(express.static(__dirname));
 
 function token(user) {
   if (!SECRET) throw new Error('JWT_SECRET is not configured');
-  return jwt.sign(
-    { id: user.id, role: user.role, email: user.email },
-    SECRET,
-    { expiresIn: '7d' }
-  );
+  return jwt.sign({ id: user.id, role: user.role, email: user.email }, SECRET, { expiresIn: '7d' });
 }
 
 function auth(req, res, next) {
@@ -101,7 +109,7 @@ function admin(req, res, next) {
 app.get('/api/health', async (req, res) => {
   try {
     await ensureAdmin();
-    res.json({ ok: true, storage: isNetlify ? 'netlify-blobs' : 'local' });
+    res.json({ ok: true, storage: isServerless ? 'netlify-blobs' : 'local' });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
@@ -160,10 +168,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!u || !(await bcrypt.compare(req.body?.password || '', u.passwordHash))) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
-    res.json({
-      token: token(u),
-      user: { id: u.id, name: u.name, email: u.email, role: u.role }
-    });
+    res.json({ token: token(u), user: { id: u.id, name: u.name, email: u.email, role: u.role } });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -216,19 +221,13 @@ app.get('/api/admin/stats', auth, admin, async (req, res) => {
 });
 
 app.get('/api/admin/orders', auth, admin, async (req, res) => {
-  try {
-    res.json((await readData()).orders);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  try { res.json((await readData()).orders); }
+  catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.get('/api/admin/products', auth, admin, async (req, res) => {
-  try {
-    res.json((await readData()).products);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  try { res.json((await readData()).products); }
+  catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.patch('/api/admin/orders/:id', auth, admin, async (req, res) => {
@@ -239,9 +238,7 @@ app.patch('/api/admin/orders/:id', auth, admin, async (req, res) => {
     o.status = req.body?.status;
     await writeData(d);
     res.json(o);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.patch('/api/admin/products/:id', auth, admin, async (req, res) => {
@@ -252,9 +249,7 @@ app.patch('/api/admin/products/:id', auth, admin, async (req, res) => {
     Object.assign(p, req.body || {});
     await writeData(d);
     res.json(p);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.post('/api/admin/products', auth, admin, async (req, res) => {
@@ -272,9 +267,7 @@ app.post('/api/admin/products', auth, admin, async (req, res) => {
     d.products.push(p);
     await writeData(d);
     res.status(201).json(p);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.patch('/api/admin/settings', auth, admin, async (req, res) => {
@@ -283,13 +276,8 @@ app.patch('/api/admin/settings', auth, admin, async (req, res) => {
     d.settings = { ...d.settings, ...(req.body || {}) };
     await writeData(d);
     res.json(d.settings);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-if (require.main === module) {
-  app.listen(process.env.PORT || 3000, () => console.log('Nepkits Hub running'));
-}
-
+if (require.main === module) app.listen(process.env.PORT || 3000, () => console.log('Nepkits Hub running'));
 module.exports = app;
